@@ -8,7 +8,9 @@ import warnings
 import numpy as np
 import pandas as pd
 
+from sktime.datatypes import update_data
 from sktime.forecasting.base import BaseForecaster
+from sktime.libs.simons import QUANTILES, prepare_covariates
 from sktime.utils.singleton import _multiton
 
 
@@ -32,10 +34,17 @@ class SimonsForecaster(BaseForecaster):
     ----------
     model_path : str, default="abel-lab/Simons-60M"
         Hugging Face model identifier or local checkpoint path.
+        See the Simons model card and references [1]_ for available checkpoints.
     revision : str or None, default=None
         Hugging Face revision to load.
     device : str, default="cpu"
         Device on which to load the model, for example ``"cpu"`` or ``"cuda"``.
+
+    References
+    ----------
+    .. [1] https://huggingface.co/collections/abel-lab/simons-1
+    .. [2] https://github.com/Abel-ai-lab/Simons
+    .. [3] https://abel.ai/research/introducing-simons/
 
     Examples
     --------
@@ -47,8 +56,8 @@ class SimonsForecaster(BaseForecaster):
 
     _tags = {
         "category": ["deep_learning", "foundation_model"],
-        "authors": ["starrynights07"],
-        "maintainers": ["starrynights07"],
+        "authors": ["saptadeep12", "Shu-Wan", "ruizhu-lgtm"],
+        "maintainers": ["saptadeep12"],
         "capability:multivariate": True,
         "capability:exogenous": True,
         "capability:missing_values": True,
@@ -56,7 +65,7 @@ class SimonsForecaster(BaseForecaster):
         "capability:insample": False,
         "capability:pred_int:insample": False,
         "capability:non_contiguous_X": False,
-        "capability:categorical_in_X": False,
+        "capability:categorical_in_X": True,
         "requires-fh-in-fit": False,
         "X-y-must-have-same-index": True,
         "y_inner_mtype": "pd.DataFrame",
@@ -86,16 +95,34 @@ class SimonsForecaster(BaseForecaster):
 
     def _fit(self, y, X=None, fh=None):
         """Store the history and load the pretrained Simons model."""
-        if X is not None and not X.index.equals(y.index):
-            raise ValueError("X and y must have the same index during fit.")
         self.context_ = y.copy()
         self.X_ = None if X is None else X.copy()
         self.model_ = self._load_model()
         return self
 
+    def _update(self, y, X=None, update_params=True):
+        """Extend the stored history without refitting the zero-shot model."""
+        self.context_ = update_data(self.context_, y)
+        if self.X_ is None:
+            if X is not None:
+                raise ValueError(
+                    "X was provided during update, but no X was provided during fit."
+                )
+        else:
+            if X is None:
+                raise ValueError(
+                    "X was provided during fit and is required during update."
+                )
+            if not X.columns.equals(self.X_.columns):
+                raise ValueError(
+                    "X columns during update must match the columns used during fit."
+                )
+            self.X_ = update_data(self.X_, X)
+        return self
+
     def _predict(self, fh, X=None):
         """Return point forecasts from Simons."""
-        predictions, index = self._forecast_quantiles(fh, X=X)
+        predictions, index = self._run_forecast(fh, X=X)
         values = predictions[:, :, 4].T
         return pd.DataFrame(values, index=index, columns=self.context_.columns)
 
@@ -111,10 +138,7 @@ class SimonsForecaster(BaseForecaster):
         if np.isscalar(alpha):
             alpha = [alpha]
         alpha = [float(value) for value in alpha]
-        supported = np.array(
-            [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
-            dtype=np.float64,
-        )
+        supported = np.asarray(QUANTILES, dtype=np.float64)
         effective_alpha = np.clip(alpha, supported[0], supported[-1])
         if not np.allclose(alpha, effective_alpha):
             warnings.warn(
@@ -124,23 +148,33 @@ class SimonsForecaster(BaseForecaster):
                 stacklevel=2,
             )
 
-        predictions, index = self._forecast_quantiles(fh, X=X)
-        positions = (effective_alpha - supported[0]) / (supported[1] - supported[0])
-        lower = np.floor(positions).astype(int)
-        upper = np.ceil(positions).astype(int)
-        weights = positions - lower
-        values = np.stack(
-            [
-                predictions[:, :, low] * (1 - weight) + predictions[:, :, high] * weight
-                for low, high, weight in zip(lower, upper, weights)
-            ],
-            axis=2,
+        predictions, index = self._run_forecast(fh, X=X)
+        values = np.apply_along_axis(
+            lambda row: np.interp(effective_alpha, supported, row),
+            axis=-1,
+            arr=predictions,
         ).transpose(1, 0, 2)
         values = values.reshape(len(index), -1)
         columns = pd.MultiIndex.from_product([self.context_.columns, alpha])
         return pd.DataFrame(values, index=index, columns=columns)
 
-    def _forecast_quantiles(self, fh, X=None):
+    def _predict_proba(self, fh, X=None, marginal=True):
+        """Return a histogram distribution from Simons' native quantiles."""
+        from skpro.distributions import HistogramQPD
+
+        predictions, index = self._run_forecast(fh, X=X)
+        levels = np.asarray(QUANTILES, dtype=np.float64)
+        row_index = pd.MultiIndex.from_product([levels, index])
+        quantiles = pd.DataFrame(
+            predictions.transpose(2, 1, 0).reshape(-1, predictions.shape[0]),
+            index=row_index,
+            columns=self.context_.columns,
+        )
+        return HistogramQPD(
+            quantiles, tails="mass", index=index, columns=self.context_.columns
+        )
+
+    def _run_forecast(self, fh, X=None):
         """Return selected Simons quantiles and their absolute forecast index."""
         import torch
 
@@ -160,7 +194,7 @@ class SimonsForecaster(BaseForecaster):
                 covariates=covariates,
             )
         predictions = predictions.detach().float().cpu().numpy()
-        expected_shape = (1, history.shape[0], horizon, 9)
+        expected_shape = (1, history.shape[0], horizon, len(QUANTILES))
         if predictions.shape != expected_shape:
             raise ValueError(
                 "Simons returned quantiles with unexpected shape "
@@ -208,12 +242,14 @@ class SimonsForecaster(BaseForecaster):
                 f"forecast horizon; missing {len(missing)} row(s)."
             )
         future = X.loc[future_index]
-        try:
-            history = np.array(self.X_, dtype=np.float32, copy=True).T
-            future = np.array(future, dtype=np.float32, copy=True).T
-        except (TypeError, ValueError) as exc:
-            raise ValueError("Simons covariates must be numeric.") from exc
-        values = np.concatenate([history, future], axis=1)
+        values = prepare_covariates(
+            length=len(self.context_),
+            horizon=horizon,
+            future=pd.concat([self.X_, future]),
+            max_covariates=16,
+        )
+        if values is None:
+            return None
         return torch.as_tensor(values, dtype=torch.float32).unsqueeze(0)
 
     def _load_model(self):
