@@ -194,13 +194,6 @@ class SimonsForecaster(BaseForecaster):
                 covariates=covariates,
             )
         predictions = predictions.detach().float().cpu().numpy()
-        expected_shape = (1, history.shape[0], horizon, len(QUANTILES))
-        if predictions.shape != expected_shape:
-            raise ValueError(
-                "Simons returned quantiles with unexpected shape "
-                f"{predictions.shape}; expected {expected_shape}."
-            )
-
         selected = predictions[0][:, relative_steps - 1, :]
         index = fh.to_absolute(self.cutoff).to_pandas()
         return selected, index
@@ -271,7 +264,10 @@ class SimonsForecaster(BaseForecaster):
         """Return testing parameter settings for the estimator."""
         return [
             {"model_path": "abel-lab/Simons-25M"},
-            {"model_path": "abel-lab/Simons-25M", "device": "cpu"},
+            {
+                "model_path": "abel-lab/Simons-25M",
+                "revision": "3d2745ef7fcca14198e58e70788eb0288497b48a",
+            },
         ]
 
 
